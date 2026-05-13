@@ -1,55 +1,91 @@
-import cv2
-import numpy as np
-from insightface.app import FaceAnalysis
-import warnings
+"""
+face_engine.py — Motor de inferencia facial
+============================================
+Modelo : buffalo_l  (InsightFace / ONNX)
+Hardware: CUDA GPU por defecto, CPU como fallback automático
+Salida  : lista de dicts normalizados por frame
 
-# [OPERATIVO]: Silencia avisos de depreciación de librerías subyacentes para una consola limpia.
+Cada dict contiene:
+  bbox      : np.ndarray int [x1, y1, x2, y2]
+  embedding : np.ndarray float32 (512,)  normalizado L2
+  res       : (ancho_px, alto_px)
+  pose      : (pitch, yaw, roll) en grados
+"""
+
+import numpy as np
+import warnings
+from insightface.app import FaceAnalysis
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-class FaceEngine:
-    # [OPERATIVO]: Constructor de la clase. Inicializa y carga en memoria los modelos de IA.
-    # [TÉCNICO]: Configura InsightFace con el paquete 'buffalo_l', priorizando aceleración por hardware (CUDA).
-    def __init__(self, ctx_id=0):
-        # Cambiamos 'antelopev2' por 'buffalo_l'
-        nombre_modelo = 'buffalo_l' 
-        print(f"--- 🔄 CARGANDO MODELO: {nombre_modelo} ---")
-        
-        # [TÉCNICO]: providers define el orden de ejecución: primero intenta GPU (CUDA), si falla usa CPU.
-        self.app = FaceAnalysis(name=nombre_modelo, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        # [TÉCNICO]: det_size define la resolución de entrada para el detector; (640, 640) es el estándar de equilibrio.
-        self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
-        
-        # [OPERATIVO]: Auditoría de carga para confirmar que todos los sub-componentes (det, rec, pose) están listos.
-        for model in self.app.models:
-            print(f"📦 Sub-modelo cargado: {model}")
 
-    # [OPERATIVO]: Analiza una imagen única (frame) para extraer toda la información facial disponible.
-    # [TÉCNICO]: Input: ndarray (BGR). Output: list(dict). Retorna coordenadas, vectores matemáticos y pose.
-    def procesar_frame(self, frame):
-        # [OPERATIVO]: Validación de integridad de la imagen de entrada.
+class FaceEngine:
+    """
+    Envuelve FaceAnalysis (buffalo_l) con una interfaz limpia.
+    Siempre intenta GPU (CUDAExecutionProvider); si no está disponible,
+    ONNX Runtime cae automáticamente a CPU.
+    """
+
+    def __init__(self, det_size: int = 640):
+        """
+        Parameters
+        ----------
+        det_size : int
+            Resolución del detector (cuadrada).
+            640  → rápido, detecta rostros desde ~80 px de ancho.
+            1280 → más lento, detecta rostros desde ~40 px (cámaras lejanas).
+        """
+        self._det_size = det_size
+        self.app = FaceAnalysis(
+            name="buffalo_l",
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        self.app.prepare(ctx_id=0, det_size=(det_size, det_size))
+        print(f"FaceEngine listo — buffalo_l  det_size={det_size}x{det_size}  [GPU→CPU fallback]")
+
+    # ------------------------------------------------------------------
+
+    def procesar_frame(self, frame: np.ndarray) -> list[dict]:
+        """
+        Ejecuta detección + alineación + reconocimiento + pose sobre un frame.
+
+        Parameters
+        ----------
+        frame : np.ndarray  BGR  (H, W, 3)
+
+        Returns
+        -------
+        list[dict]  — vacío si no hay rostros o frame inválido.
+        """
         if frame is None or frame.size == 0:
             return []
-        
-        # [TÉCNICO]: Ejecución de la inferencia completa: Detección + Alineación + Reconocimiento + Pose.
-        faces = self.app.get(frame)
-        resultados = []
-        
-        for face in faces:
-            # [OPERATIVO]: Calcula el tamaño físico del rostro detectado para filtros de distancia.
-            bbox = face.bbox.astype(int)
-            ancho = bbox[2] - bbox[0]
-            alto = bbox[3] - bbox[1]
-            
-            # [OPERATIVO]: Extrae los ángulos de Euler: Pitch (inclinación), Yaw (giro), Roll (rotación).
-            p, y, r = face.pose
-            
-            # [TÉCNICO]: Estructura de datos normalizada para el consumo del resto de funciones del script.
-            resultados.append({
-                'bbox': bbox, 
-                'embedding': face.normed_embedding, # Vector de 512 dimensiones normalizado.
-                'res': (ancho, alto),
-                'pose': (p, y, r)
-            })
-        return resultados
 
-   
+        try:
+            faces = self.app.get(frame)
+        except Exception as e:
+            print(f"  [FaceEngine] Error en inferencia: {e}")
+            return []
+
+        resultados = []
+        for face in faces:
+            emb = face.normed_embedding
+            if emb is None:
+                continue
+
+            bbox  = face.bbox.astype(int)
+            ancho = int(bbox[2] - bbox[0])
+            alto  = int(bbox[3] - bbox[1])
+
+            try:
+                pitch, yaw, roll = face.pose
+            except Exception:
+                pitch, yaw, roll = 0.0, 0.0, 0.0
+
+            resultados.append({
+                "bbox"     : bbox,
+                "embedding": emb.astype(np.float32),
+                "res"      : (ancho, alto),
+                "pose"     : (float(pitch), float(yaw), float(roll)),
+            })
+
+        return resultados

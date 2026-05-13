@@ -1,31 +1,35 @@
 """
-registro_por_video.py — Un solo PKL por persona con 6 ángulos (v6)
-===================================================================
-Cambios respecto a v5:
-  - HUD de una sola línea: solo imprime cuando hay un evento (nueva
-    captura o mejora). Sin flood de consola.
-  - Soporte GPU: argumento --gpu (ctx_id=0) para acelerar inferencia.
-  - Ventanas diagonales más permisivas: umbral de entrada reducido a
-    ±10° en yaw y pitch para facilitar la captura.
+registro_por_video.py — Registro biométrico multi-ángulo desde video
+=====================================================================
+Extrae hasta 6 embeddings (uno por ángulo de pose) del video indicado
+y los guarda en un único PKL por persona.
 
-Estructura del PKL:
-  {
-    'version': 3,
-    'subject_id': 'nombre_del_video',
-    'gallery': [
-        {'embedding': array(512,), 'pose_tag': 'frontal',            ...},
-        {'embedding': array(512,), 'pose_tag': 'frontal_abajo',      ...},
-        {'embedding': array(512,), 'pose_tag': 'tres_cuartos_izq',   ...},
-        {'embedding': array(512,), 'pose_tag': 'tres_cuartos_der',   ...},
-        {'embedding': array(512,), 'pose_tag': 'diagonal_abajo_izq', ...},
-        {'embedding': array(512,), 'pose_tag': 'diagonal_abajo_der', ...},
-    ],
-    'registered_at': timestamp,
-    'update_count': 0,
-  }
+Uso:
+    python registro_por_video.py
+    python registro_por_video.py --video "ruta/al/video.mp4"
+    python registro_por_video.py --video "ruta/al/video.mp4" --diagnostico
 
-Archivo : data/embeddings/<nombre>_embedding.pkl
-Imágenes: data/raw/<nombre>/pose_<tag>.jpg
+Estructura del PKL generado:
+    {
+        "subject_id"   : "Nombre_Apellido",
+        "gallery"      : [
+            {
+                "embedding" : np.ndarray (512,) normalizado L2,
+                "pose_tag"  : str,
+                "dist_ideal": float,
+                "pitch"     : float,
+                "yaw"       : float,
+                "nitidez"   : float,
+                "timestamp" : float,
+            },
+            ...  (hasta 6 entradas, una por ángulo)
+        ],
+        "registered_at": float  (unix timestamp),
+    }
+
+Archivos generados:
+    data/embeddings/<nombre>_embedding.pkl
+    data/raw/<nombre>/pose_<tag>.jpg
 """
 
 import cv2
@@ -35,30 +39,26 @@ import pickle
 import time
 import argparse
 import numpy as np
-from src.face_engine import FaceEngine
 
 sys.path.insert(0, os.path.dirname(__file__))
+from src.face_engine import FaceEngine
 
 
 # ==========================================================
-# CONFIGURACIÓN DE EJES Y FILTROS TÉCNICOS
+# PARÁMETROS DE CALIDAD
 # ==========================================================
-PITCH_IDX   = 0
-YAW_IDX     = 1
+NITIDEZ_MIN = 50.0   # Varianza de Laplaciano mínima para aceptar un frame
+TAMANO_MIN  = 60     # Ancho mínimo del rostro en píxeles
+HUD_WIDTH   = 110    # Ancho de la línea de estado en consola
 
-NITIDEZ_MIN = 50.0
-TAMANO_MIN  = 60
-
-# Ancho fijo del HUD. Ajusta al ancho de tu terminal si es necesario.
-HUD_WIDTH   = 110
+# Índices del vector pose de InsightFace
+PITCH_IDX = 0
+YAW_IDX   = 1
 
 
 # ==========================================================
-# ÁNGULOS OBJETIVO
+# DEFINICIÓN DE ÁNGULOS OBJETIVO
 # ==========================================================
-# Diagonales: umbral de entrada reducido a ±10° (antes ±18°) y punto
-# ideal acercado al borde para que frames con giro moderado + barbilla
-# ligeramente baja ya clasifiquen.
 POSES_OBJETIVO = {
     "frontal": {
         "short"      : "FRONTAL",
@@ -94,10 +94,8 @@ POSES_OBJETIVO = {
     },
     "diagonal_abajo_izq": {
         "short"      : "DIAG_IZQ",
-        # Umbral de entrada reducido de -18 a -10 en ambos ejes.
         "yaw_min"    : -65,  "yaw_max"    : -10,
         "pitch_min"  : -55,  "pitch_max"  : -10,
-        # Ideal más cercano al borde para maximizar capturas válidas.
         "yaw_ideal"  : -30,  "pitch_ideal": -25,
         "label"      : "Diagonal abajo izquierda",
         "instruccion": "Gira a tu izquierda y baja ligeramente la barbilla",
@@ -123,15 +121,11 @@ ORDEN_POSES = [
 
 
 # ==========================================================
-# HELPERS
+# UTILIDADES INTERNAS
 # ==========================================================
 
-def _extraer_pose(rostro) -> tuple:
-    pose = rostro.get("pose", (0, 0, 0))
-    return float(pose[PITCH_IDX]), float(pose[YAW_IDX])
-
-
-def _nitidez(frame, bbox) -> float:
+def _nitidez(frame: np.ndarray, bbox) -> float:
+    """Varianza del Laplaciano sobre el ROI del rostro — proxy de nitidez."""
     x1, y1, x2, y2 = [int(v) for v in bbox]
     h, w = frame.shape[:2]
     roi = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
@@ -141,30 +135,32 @@ def _nitidez(frame, bbox) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
-def _dist_ideal(pitch, yaw, cfg) -> float:
-    return float(np.sqrt((pitch - cfg["pitch_ideal"])**2 +
-                         (yaw   - cfg["yaw_ideal"]  )**2))
+def _dist_ideal(pitch: float, yaw: float, cfg: dict) -> float:
+    """Distancia euclidiana al ángulo perfecto definido en la configuración."""
+    return float(np.sqrt((pitch - cfg["pitch_ideal"]) ** 2 +
+                         (yaw   - cfg["yaw_ideal"])   ** 2))
 
 
-def _pasa_ventana(pitch, yaw, cfg) -> bool:
-    return (cfg["yaw_min"] <= yaw <= cfg["yaw_max"] and
+def _pasa_ventana(pitch: float, yaw: float, cfg: dict) -> bool:
+    """True si pitch/yaw caen dentro de la ventana angular del ángulo objetivo."""
+    return (cfg["yaw_min"]   <= yaw   <= cfg["yaw_max"] and
             cfg["pitch_min"] <= pitch <= cfg["pitch_max"])
 
 
-def _crop_rostro(frame, bbox, margen=50):
+def _crop_rostro(frame: np.ndarray, bbox, margen: int = 50) -> np.ndarray:
+    """Recorta el rostro con margen para guardar como imagen de referencia."""
     x1, y1, x2, y2 = [int(v) for v in bbox]
     h, w = frame.shape[:2]
-    return frame[max(0, y1-margen):min(h, y2+margen),
-                 max(0, x1-margen):min(w, x2+margen)]
+    return frame[max(0, y1 - margen):min(h, y2 + margen),
+                 max(0, x1 - margen):min(w, x2 + margen)]
 
 
-def _zona_actual(pitch, yaw) -> str:
-    """Clasifica la posición actual de la cabeza en texto corto."""
+def _zona_actual(pitch: float, yaw: float) -> str:
+    """Clasifica la posición de la cabeza en un texto corto para el HUD."""
     izq  = yaw   < -10
     der  = yaw   > +10
     abaj = pitch < -10
     arri = pitch > +18
-
     if not izq and not der and not abaj and not arri: return "FRONTAL"
     if not izq and not der and arri:                  return "ARRIBA"
     if not izq and not der and abaj:                  return "F_ABAJO"
@@ -175,109 +171,50 @@ def _zona_actual(pitch, yaw) -> str:
     return "TRANS"
 
 
-def _barra_estado(capturas, mejoras) -> str:
-    """Cadena compacta de estado para el HUD de una sola línea."""
+def _barra_estado(capturas: dict, mejoras: dict) -> str:
+    """Cadena compacta de estado de todas las poses para el HUD de una línea."""
     partes = []
     for tag in ORDEN_POSES:
         short  = POSES_OBJETIVO[tag]["short"]
         icono  = "OK" if capturas[tag] else "--"
-        m      = mejoras[tag]
-        sufijo = f"+{m}" if capturas[tag] and m > 0 else ""
+        sufijo = f"+{mejoras[tag]}" if capturas[tag] and mejoras[tag] > 0 else ""
         partes.append(f"[{icono}]{short}{sufijo}")
     return "  ".join(partes)
 
 
-def _imprimir_hud(capturas, mejoras, pct, completados,
-                  total, pitch=None, yaw=None):
-    """
-    Sobreescribe UNA sola línea en consola con \\r.
-    La cadena se rellena a HUD_WIDTH para borrar residuos anteriores.
-    """
+def _imprimir_hud(capturas: dict, mejoras: dict, pct: int,
+                  completados: int, total: int,
+                  pitch: float = None, yaw: float = None):
+    """Sobreescribe una única línea en consola con el estado actual."""
     barra = _barra_estado(capturas, mejoras)
     zona  = _zona_actual(pitch, yaw) if pitch is not None else "---"
     info  = f"[{pct:3d}%] {completados}/{total}  {zona:<10}"
     linea = f"  {barra}  {info}"
-    linea = linea[:HUD_WIDTH].ljust(HUD_WIDTH)
-    print(f"\r{linea}", end="", flush=True)
+    print(f"\r{linea[:HUD_WIDTH].ljust(HUD_WIDTH)}", end="", flush=True)
 
 
 def _nombre_desde_video(video_path: str) -> str:
-    """Extrae el nombre del sujeto del stem del archivo de video."""
+    """Extrae el nombre del sujeto del nombre del archivo de video."""
     stem = os.path.splitext(os.path.basename(video_path))[0]
-    safe = stem.replace(" ", "_").replace('"', "").replace("'", "")
-    return safe
+    return stem.replace(" ", "_").replace('"', "").replace("'", "")
 
 
 # ==========================================================
-# GUARDADO
+# EXTRACCIÓN DE ÁNGULOS
 # ==========================================================
 
-def guardar_resultado(nombre: str, capturas: dict, db_path: str):
-    carpeta_raw = os.path.join(db_path, "raw", nombre)
-    carpeta_emb = os.path.join(db_path, "embeddings")
-    os.makedirs(carpeta_raw, exist_ok=True)
-    os.makedirs(carpeta_emb, exist_ok=True)
+def extraer_angulos(video_path: str, engine: FaceEngine,
+                    modo_diagnostico: bool = False) -> tuple[dict, dict]:
+    """
+    Recorre el video frame a frame y guarda el mejor embedding por ángulo.
+    El criterio de "mejor" es la menor distancia al ángulo ideal definido
+    en POSES_OBJETIVO (se refina a lo largo de todo el video).
 
-    gallery = []
-    imagenes_guardadas = 0
-
-    for tag in ORDEN_POSES:
-        datos = capturas.get(tag)
-        if datos is None:
-            continue
-
-        emb  = datos["embedding"]
-        norm = np.linalg.norm(emb)
-        emb  = emb / norm if norm > 0 else emb
-
-        gallery.append({
-            "embedding" : emb,
-            "pose_tag"  : tag,
-            "dist_ideal": round(datos["dist"], 3),
-            "pitch"     : datos["pitch"],
-            "yaw"       : datos["yaw"],
-            "nitidez"   : datos["nitidez"],
-            "timestamp" : datos["timestamp"],
-        })
-
-        ruta_jpg = os.path.join(carpeta_raw, f"pose_{tag}.jpg")
-        cv2.imwrite(ruta_jpg, datos["crop"])
-        imagenes_guardadas += 1
-
-    if not gallery:
-        print("  ERROR: Galeria vacia, no hay nada que guardar.")
-        return 0
-
-    payload = {
-        "version"      : 3,
-        "subject_id"   : nombre,
-        "gallery"      : gallery,
-        "registered_at": time.time(),
-        "update_count" : 0,
-    }
-
-    # Escritura atómica: temp → rename.
-    ruta_pkl = os.path.join(carpeta_emb, f"{nombre}_embedding.pkl")
-    tmp = ruta_pkl + ".tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, ruta_pkl)
-
-    print(f"\n  PKL guardado : {os.path.basename(ruta_pkl)}")
-    print(f"  Angulos      : {len(gallery)}/6")
-    for entry in gallery:
-        print(f"    {entry['pose_tag']:<24} dist={entry['dist_ideal']:.2f}  "
-              f"yaw={entry['yaw']:+.1f}  pitch={entry['pitch']:+.1f}")
-    print(f"  Imagenes     : data/raw/{nombre}/")
-
-    return imagenes_guardadas
-
-
-# ==========================================================
-# EXTRACCIÓN CON REFINAMIENTO
-# ==========================================================
-
-def extraer_angulos(video_path: str, engine, modo_diagnostico=False) -> tuple:
+    Returns
+    -------
+    capturas : dict  { pose_tag: datos | None }
+    mejoras  : dict  { pose_tag: int }   veces que se mejoró el candidato
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"\nERROR: No se pudo abrir: {video_path}")
@@ -292,14 +229,13 @@ def extraer_angulos(video_path: str, engine, modo_diagnostico=False) -> tuple:
           f"Duracion: {total_frames / fps_video:.1f}s\n")
 
     if modo_diagnostico:
-        print(f"  {'FRAME':>6}  {'PITCH':>8}  {'YAW':>8}  {'NIT':>8}  "
-              f"{'ANCHO':>6}  ZONA")
-        print(f"  {'─'*62}")
+        print(f"  {'FRAME':>6}  {'PITCH':>8}  {'YAW':>8}  {'NIT':>8}  {'ANCHO':>6}  ZONA")
+        print(f"  {'─' * 62}")
 
     capturas         = {tag: None for tag in POSES_OBJETIVO}
     mejoras          = {tag: 0    for tag in POSES_OBJETIVO}
     frame_num        = 0
-    prev_completados = -1  # Para detectar cambios en el HUD
+    prev_completados = -1
 
     if not modo_diagnostico:
         _imprimir_hud(capturas, mejoras, 0, 0, n_poses)
@@ -309,25 +245,22 @@ def extraer_angulos(video_path: str, engine, modo_diagnostico=False) -> tuple:
         if not ret:
             break
 
-        rostros = engine.procesar_frame(frame)
-
-        ultimo_pitch, ultimo_yaw = None, None
+        rostros   = engine.procesar_frame(frame)
+        ult_pitch = None
+        ult_yaw   = None
         hubo_evento = False
 
         for r in rostros:
-            ancho = r["res"][0]
-            if ancho < TAMANO_MIN:
+            if r["res"][0] < TAMANO_MIN:
                 continue
 
-            nit        = _nitidez(frame, r["bbox"])
-            pitch, yaw = _extraer_pose(r)
-            emb        = r["embedding"]
-
-            ultimo_pitch, ultimo_yaw = pitch, yaw
+            nit          = _nitidez(frame, r["bbox"])
+            pitch, yaw, _ = r["pose"]
+            ult_pitch, ult_yaw = pitch, yaw
 
             if modo_diagnostico:
                 print(f"  {frame_num:>6}  {pitch:>+8.2f}  {yaw:>+8.2f}  "
-                      f"{nit:>8.1f}  {ancho:>6}  {_zona_actual(pitch, yaw)}")
+                      f"{nit:>8.1f}  {r['res'][0]:>6}  {_zona_actual(pitch, yaw)}")
 
             if nit < NITIDEZ_MIN:
                 continue
@@ -343,64 +276,120 @@ def extraer_angulos(video_path: str, engine, modo_diagnostico=False) -> tuple:
                 if es_primera or es_mejor:
                     capturas[tag] = {
                         "dist"     : dist,
-                        "embedding": emb.copy(),
+                        "embedding": r["embedding"].copy(),
                         "crop"     : _crop_rostro(frame, r["bbox"]),
                         "pitch"    : round(pitch, 2),
                         "yaw"      : round(yaw,   2),
                         "nitidez"  : round(nit,   1),
                         "timestamp": time.time(),
-                        "frame_num": frame_num,
                     }
                     if es_mejor:
                         mejoras[tag] += 1
-                    hubo_evento = True  # Hay algo nuevo que mostrar
+                    hubo_evento = True
 
-        # ── Actualización del HUD ────────────────────────────────────
-        # Solo se redibuya en dos casos:
-        #   1) Hubo una captura nueva o mejora (evento relevante).
-        #   2) Cambió el número total de poses completadas.
-        # Así se evita el flood de líneas.
         if not modo_diagnostico:
             completados = sum(1 for v in capturas.values() if v is not None)
             pct         = int(frame_num / max(total_frames, 1) * 100)
-
             if hubo_evento or completados != prev_completados:
                 _imprimir_hud(capturas, mejoras, pct, completados,
-                              n_poses, ultimo_pitch, ultimo_yaw)
+                              n_poses, ult_pitch, ult_yaw)
                 prev_completados = completados
 
         frame_num += 1
 
     cap.release()
+
     completados = sum(1 for v in capturas.values() if v is not None)
     if not modo_diagnostico:
         _imprimir_hud(capturas, mejoras, 100, completados, n_poses)
-        print()   # Salto limpio al terminar
+        print()
+
     return capturas, mejoras
 
 
 # ==========================================================
-# RESUMEN
+# RESUMEN EN CONSOLA
 # ==========================================================
 
 def imprimir_resumen(capturas: dict, mejoras: dict):
-    print(f"\n  {'─'*78}")
+    print(f"\n  {'─' * 78}")
     print(f"  {'ANGULO':<28} {'YAW':>6} {'PITCH':>6} {'NIT':>7} "
-          f"{'FRAME':>6} {'DIST_IDEAL':>10} {'MEJORAS':>7}  OK")
-    print(f"  {'─'*78}")
+          f"{'DIST_IDEAL':>10} {'MEJORAS':>7}  OK")
+    print(f"  {'─' * 78}")
     for tag in ORDEN_POSES:
         cfg  = POSES_OBJETIVO[tag]
         dato = capturas[tag]
         if dato:
             print(f"  {cfg['label']:<28} {dato['yaw']:>+6.1f} {dato['pitch']:>+6.1f} "
-                  f"{dato['nitidez']:>7.1f} {dato['frame_num']:>6} "
-                  f"{dato['dist']:>10.2f} {mejoras[tag]:>7}  SI")
+                  f"{dato['nitidez']:>7.1f} {dato['dist']:>10.2f} "
+                  f"{mejoras[tag]:>7}  SI")
         else:
             print(f"  {cfg['label']:<28} {'—':>6} {'—':>6} {'—':>7} "
-                  f"{'—':>6} {'—':>10} {'—':>7}  NO")
-    print(f"  {'─'*78}")
+                  f"{'—':>10} {'—':>7}  NO")
+    print(f"  {'─' * 78}")
     print(f"  DIST_IDEAL = distancia al angulo perfecto (menor = mejor)")
-    print(f"  MEJORAS    = veces que se reemplazo por un frame mas cercano al ideal")
+    print(f"  MEJORAS    = veces que se reemplazo por frame mas cercano al ideal")
+
+
+# ==========================================================
+# GUARDADO ATÓMICO
+# ==========================================================
+
+def guardar_resultado(nombre: str, capturas: dict, db_path: str) -> int:
+    """
+    Guarda el PKL con escritura atómica (tmp → rename) y las imágenes de referencia.
+    Formato del PKL: { subject_id, gallery, registered_at }
+    """
+    carpeta_raw = os.path.join(db_path, "raw", nombre)
+    carpeta_emb = os.path.join(db_path, "embeddings")
+    os.makedirs(carpeta_raw, exist_ok=True)
+    os.makedirs(carpeta_emb, exist_ok=True)
+
+    gallery = []
+    for tag in ORDEN_POSES:
+        datos = capturas.get(tag)
+        if datos is None:
+            continue
+
+        emb  = datos["embedding"].astype(np.float32)
+        norm = np.linalg.norm(emb)
+        emb  = emb / norm if norm > 0 else emb
+
+        gallery.append({
+            "embedding" : emb,
+            "pose_tag"  : tag,
+            "dist_ideal": round(datos["dist"],    3),
+            "pitch"     : datos["pitch"],
+            "yaw"       : datos["yaw"],
+            "nitidez"   : datos["nitidez"],
+            "timestamp" : datos["timestamp"],
+        })
+
+        cv2.imwrite(os.path.join(carpeta_raw, f"pose_{tag}.jpg"), datos["crop"])
+
+    if not gallery:
+        print("  ERROR: Galeria vacia, nada que guardar.")
+        return 0
+
+    payload = {
+        "subject_id"   : nombre,
+        "gallery"      : gallery,
+        "registered_at": time.time(),
+    }
+
+    ruta_pkl = os.path.join(carpeta_emb, f"{nombre}_embedding.pkl")
+    tmp      = ruta_pkl + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, ruta_pkl)
+
+    print(f"\n  PKL guardado : {os.path.basename(ruta_pkl)}")
+    print(f"  Angulos      : {len(gallery)}/6")
+    for entry in gallery:
+        print(f"    {entry['pose_tag']:<24}  dist={entry['dist_ideal']:.2f}  "
+              f"yaw={entry['yaw']:+.1f}  pitch={entry['pitch']:+.1f}")
+    print(f"  Imagenes     : data/raw/{nombre}/")
+    return len(gallery)
 
 
 # ==========================================================
@@ -412,28 +401,23 @@ def main():
     parser.add_argument("--video",       default=None,
                         help="Ruta al archivo de video")
     parser.add_argument("--db_path",     default="data",
-                        help="Directorio raiz de la base de datos")
+                        help="Directorio raiz de la base de datos (default: data)")
     parser.add_argument("--diagnostico", action="store_true",
-                        help="Imprime telemetria sin guardar")
-    # [TÉCNICO]: ctx_id=0 → primera GPU CUDA; ctx_id=-1 → CPU.
-    parser.add_argument("--gpu",         action="store_true",
-                        help="Usar GPU (CUDA) para la inferencia")
+                        help="Imprime telemetria de pose/nitidez sin guardar")
     args = parser.parse_args()
 
-    print("\n" + "="*64)
-    print("  REGISTRO BIOMETRICO POR VIDEO - 6 ANGULOS  v6")
-    print("="*64)
-    dispositivo = "GPU (CUDA)" if args.gpu else "CPU"
-    print(f"  Dispositivo : {dispositivo}")
-    print(f"  1 PKL por persona con todos los angulos dentro")
+    print("\n" + "=" * 64)
+    print("  REGISTRO BIOMETRICO POR VIDEO — 6 ANGULOS")
+    print("=" * 64)
+    print("  Dispositivo : GPU (CUDA) con fallback a CPU")
 
     if not args.diagnostico:
-        print(f"\n  Instrucciones:")
+        print(f"\n  Instrucciones de pose:")
         for tag in ORDEN_POSES:
             cfg = POSES_OBJETIVO[tag]
             print(f"    [{cfg['short']:<10}]  {cfg['instruccion']}")
 
-    # Validar ruta de video
+    # Ruta del video
     video_path = args.video
     if not video_path:
         video_path = input("\n  Ruta del video: ").strip().strip('"').strip("'")
@@ -441,14 +425,13 @@ def main():
         print(f"\nERROR: No encontrado: {video_path}")
         sys.exit(1)
 
-    # Nombre derivado automáticamente del archivo de video.
     nombre = _nombre_desde_video(video_path)
     print(f"\n  Sujeto      : '{nombre}'  (del nombre del archivo)")
 
     if not args.diagnostico:
-        ruta_pkl_existente = os.path.join(args.db_path, "embeddings",
-                                          f"{nombre}_embedding.pkl")
-        if os.path.exists(ruta_pkl_existente):
+        ruta_pkl = os.path.join(args.db_path, "embeddings",
+                                f"{nombre}_embedding.pkl")
+        if os.path.exists(ruta_pkl):
             resp = input(
                 f"\n  Ya existe registro para '{nombre}'. Sobreescribir? [s/n]: "
             ).strip().lower()
@@ -457,15 +440,11 @@ def main():
                 sys.exit(0)
 
     print()
-
-    # Inicializar motor con o sin GPU.
-    ctx_id = 0 if args.gpu else -1
-    engine = FaceEngine(ctx_id=ctx_id)
-
+    engine = FaceEngine(det_size=640)
     capturas, mejoras = extraer_angulos(video_path, engine, args.diagnostico)
 
     if args.diagnostico:
-        print(f"\n  Diagnostico completo.")
+        print("\n  Diagnostico completo.")
         sys.exit(0)
 
     imprimir_resumen(capturas, mejoras)
@@ -482,13 +461,11 @@ def main():
             sys.exit(0)
 
     print()
-    guardados = guardar_resultado(nombre, capturas, args.db_path)
+    guardar_resultado(nombre, capturas, args.db_path)
 
-    print(f"\n{'='*64}")
+    print(f"\n{'=' * 64}")
     print(f"  REGISTRO COMPLETADO : {nombre}")
-    print(f"  1 PKL con {guardados} angulos  ->  data/embeddings/")
-    print(f"  {guardados} imagenes           ->  data/raw/{nombre}/")
-    print(f"{'='*64}\n")
+    print(f"{'=' * 64}\n")
 
 
 if __name__ == "__main__":
