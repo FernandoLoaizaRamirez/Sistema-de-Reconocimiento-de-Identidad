@@ -1,0 +1,32 @@
+# Entornos virtuales
+venv/
+env/
+.env
+
+# Python caché
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Videos (Pesan demasiado para GitHub)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Datos y resultados (Opcional, pero suele ser mejor generarlos localmente)
+*.csv
+data/
+videos_camaras/
+Videos/
+Videos Embendding/
+
+# Modelos (Si son pesados, mejor no subirlos)
+models/
+
+# Instaladores
+*.whl
+
+# IDEs
+.vscode/
+.idea/
