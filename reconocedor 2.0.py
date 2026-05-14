@@ -42,11 +42,11 @@ DB_PATH           = "data/embeddings"
 # Umbrales de distancia L2 para decisión de identidad.
 # Reducir UMBRAL_CONFIRMAR si hay muchos falsos positivos.
 # Aumentarlo si personas conocidas no son reconocidas.
-UMBRAL_CONFIRMAR  = 1.15   # dist < este valor → reconocido
-UMBRAL_DESCONOCIDO = 1.45  # dist > este valor → desconocido definitivo
+UMBRAL_CONFIRMAR  = 1.25   # dist < este valor → reconocido
+UMBRAL_DESCONOCIDO = 1.36  # dist > este valor → desconocido definitivo
 #   Zona entre ambos valores: "posible" — muestra nombre con baja confianza.
 
-TAMANO_MIN_PX     = 20     # Ignorar rostros más pequeños (px de ancho)
+TAMANO_MIN_PX     = 30     # Ignorar rostros más pequeños (px de ancho)
 
 RTSP_CAM1 = "rtsp://LoaizaStream:YfPvHbQX68zBCRJ@192.168.30.110:554/Streaming/Channels/101"
 RTSP_CAM2 = "rtsp://LoaizaStream:YfPvHbQX68zBCRJ@192.168.30.111:554/Streaming/Channels/101"
