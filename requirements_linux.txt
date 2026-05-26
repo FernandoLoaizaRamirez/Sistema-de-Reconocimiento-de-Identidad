@@ -1,0 +1,12 @@
+# Requirements for Linux (Ubuntu/Debian)
+
+# Core dependencies
+# Note: Ensure CUDA and cuDNN are installed on the system
+insightface==0.7.3
+onnxruntime-gpu>=1.16.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+
+# Utilities
+tqdm
+argparse

@@ -1,32 +1,36 @@
-# Entornos virtuales
+# Python Virtual Environment
 venv/
+.venv/
 env/
-.env
 
-# Python caché
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Videos (Pesan demasiado para GitHub)
+# Data and Models
+data/
+~/.insightface/
+
+# Videos and heavy assets
+Videos/
+"Videos Embendding/"
+videos_camaras/
 *.mp4
 *.avi
 *.mov
-*.mkv
 
-# Datos y resultados (Opcional, pero suele ser mejor generarlos localmente)
+# Reports and temporary files
+*.tmp
+*.log
 *.csv
-data/
-videos_camaras/
-Videos/
-Videos Embendding/
-
-# Modelos (Si son pesados, mejor no subirlos)
-models/
-
-# Instaladores
-*.whl
-
-# IDEs
-.vscode/
 .idea/
+.vscode/
+
+# Project specific
+nul
+documentacion_formal.tex
+extractor_limites_controlado.py
+extradctor_datos.py
+extraer_limites_sistema.py
+generar_ficha_tecnica.py

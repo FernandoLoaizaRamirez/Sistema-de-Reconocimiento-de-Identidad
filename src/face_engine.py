@@ -12,28 +12,33 @@ Cada dict contiene:
   pose      : (pitch, yaw, roll) en grados
 """
 
-import numpy as np
 import warnings
+
+import numpy as np
 from insightface.app import FaceAnalysis
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 class FaceEngine:
-    """
-    Envuelve FaceAnalysis (buffalo_l) con una interfaz limpia.
-    Siempre intenta GPU (CUDAExecutionProvider); si no está disponible,
-    ONNX Runtime cae automáticamente a CPU.
+    """Motor de inferencia facial que envuelve el modelo buffalo_l de InsightFace.
+
+    Intenta utilizar GPU (CUDA) por defecto y cambia automáticamente a CPU si no hay
+    hardware compatible disponible. Proporciona una interfaz simplificada para
+    obtener detecciones, embeddings y poses.
+
+    Attributes:
+        _det_size (int): Resolución del detector configurada.
+        app (FaceAnalysis): Instancia del motor de análisis facial de InsightFace.
     """
 
     def __init__(self, det_size: int = 640):
-        """
-        Parameters
-        ----------
-        det_size : int
-            Resolución del detector (cuadrada).
-            640  → rápido, detecta rostros desde ~80 px de ancho.
-            1280 → más lento, detecta rostros desde ~40 px (cámaras lejanas).
+        """Inicializa el motor de inferencia.
+
+        Args:
+            det_size (int): Resolución del detector (cuadrada).
+                640 → rápido, recomendado para rostros cercanos.
+                1280 → más preciso, útil para cámaras lejanas o rostros pequeños.
         """
         self._det_size = det_size
         self.app = FaceAnalysis(
@@ -41,21 +46,22 @@ class FaceEngine:
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
         self.app.prepare(ctx_id=0, det_size=(det_size, det_size))
-        print(f"FaceEngine listo — buffalo_l  det_size={det_size}x{det_size}  [GPU→CPU fallback]")
+        print(
+            f"FaceEngine listo — buffalo_l  det_size={det_size}x{det_size}  [GPU→CPU fallback]"
+        )
 
     # ------------------------------------------------------------------
 
     def procesar_frame(self, frame: np.ndarray) -> list[dict]:
-        """
-        Ejecuta detección + alineación + reconocimiento + pose sobre un frame.
+        """Ejecuta detección, alineación, reconocimiento y estimación de pose.
 
-        Parameters
-        ----------
-        frame : np.ndarray  BGR  (H, W, 3)
+        Args:
+            frame (np.ndarray): Imagen en formato BGR (H, W, 3).
 
-        Returns
-        -------
-        list[dict]  — vacío si no hay rostros o frame inválido.
+        Returns:
+            list[dict]: Lista de diccionarios con la información de cada rostro detectado.
+                Cada diccionario contiene 'bbox', 'embedding', 'res' y 'pose'.
+                Retorna una lista vacía si no hay rostros o el frame es inválido.
         """
         if frame is None or frame.size == 0:
             return []
@@ -72,20 +78,22 @@ class FaceEngine:
             if emb is None:
                 continue
 
-            bbox  = face.bbox.astype(int)
+            bbox = face.bbox.astype(int)
             ancho = int(bbox[2] - bbox[0])
-            alto  = int(bbox[3] - bbox[1])
+            alto = int(bbox[3] - bbox[1])
 
             try:
                 pitch, yaw, roll = face.pose
             except Exception:
                 pitch, yaw, roll = 0.0, 0.0, 0.0
 
-            resultados.append({
-                "bbox"     : bbox,
-                "embedding": emb.astype(np.float32),
-                "res"      : (ancho, alto),
-                "pose"     : (float(pitch), float(yaw), float(roll)),
-            })
+            resultados.append(
+                {
+                    "bbox": bbox,
+                    "embedding": emb.astype(np.float32),
+                    "res": (ancho, alto),
+                    "pose": (float(pitch), float(yaw), float(roll)),
+                }
+            )
 
         return resultados

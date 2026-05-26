@@ -1,80 +1,108 @@
+# Documented version
 """
-reconocedor.py — Sistema de Reconocimiento Facial
-==================================================
-Modelo : buffalo_l (InsightFace)
-DB     : PKLs cargados en RAM al arrancar — búsqueda vectorizada
-Display: verde = reconocido, rojo = desconocido
+reconocedor.py — Sistema de Reconocimiento Facial en Tiempo Real
+================================================================
+Modelo   : buffalo_l  (InsightFace)  vía FaceEngine
+Galería  : PKLs cargados en RAM al arrancar — búsqueda vectorizada NumPy
+Hardware : GPU (CUDA) con fallback automático a CPU
+Display  : verde = reconocido  |  rojo = desconocido
+
+Formato PKL esperado (producido por registro_por_video.py):
+    {
+        "subject_id"   : str,
+        "gallery"      : [ { "embedding": ndarray(512,), ... }, ... ],
+        "registered_at": float,
+    }
 
 Uso:
-  python reconocedor.py
+    python reconocedor.py
+    python reconocedor.py --det_size 1280   # para cámaras lejanas
 """
+
+import argparse
+import os
+import pickle
+import sys
+import threading
+import time
+import warnings
 
 import cv2
 import numpy as np
-import os
-import sys
-import pickle
-import time
-import threading
-import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
-try:
-    from src.face_engine import FaceEngine
-except ModuleNotFoundError:
-    from face_engine import FaceEngine
+from src.face_engine import FaceEngine
 
-from insightface.app import FaceAnalysis
-import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ==========================================================
-# AJUSTA AQUÍ SI NECESITAS
+# CONFIGURACIÓN GLOBAL
 # ==========================================================
-DB_PATH               = "data/embeddings"
-UMBRAL_RECONOCIMIENTO = 1.05   # L2: menor = más estricto
-TAMANO_MIN_PX         = 50     # ignorar rostros más pequeños que esto
-COOLDOWN_LABEL_SEG    = 2.0    # segundos que permanece el nombre en pantalla
+DB_PATH = "data/embeddings"
 
-RTSP_CAM1 = "rtsp://LoaizaStream:YfPvHbQX68zBCRJ@192.168.30.110:554/Streaming/Channels/101"
-RTSP_CAM2 = "rtsp://LoaizaStream:YfPvHbQX68zBCRJ@192.168.30.111:554/Streaming/Channels/101"
+# Umbrales de distancia L2 para decisión de identidad.
+# Reducir UMBRAL_CONFIRMAR si hay muchos falsos positivos.
+# Aumentarlo si personas conocidas no son reconocidas.
+UMBRAL_CONFIRMAR = 1.15  # dist < este valor → reconocido
+
+TAMANO_MIN_PX = 20  # Ignorar rostros más pequeños (px de ancho)
+
+RTSP_CAM1 = (
+    "rtsp://LoaizaStream:YfPvHbQX68zBCRJ@192.168.30.110:554/Streaming/Channels/101"
+)
+RTSP_CAM2 = (
+    "rtsp://LoaizaStream:YfPvHbQX68zBCRJ@192.168.30.111:554/Streaming/Channels/101"
+)
 
 COLOR_VERDE = (0, 210, 0)
-COLOR_ROJO  = (0, 0, 210)
-FONT        = cv2.FONT_HERSHEY_SIMPLEX
+COLOR_ROJO = (0, 0, 210)
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 # ==========================================================
-# GALERÍA EN RAM
+# GALERÍA EN RAM — búsqueda vectorizada
 # ==========================================================
+
 
 class GaleriaRAM:
-    """
-    Carga todos los PKL en un diccionario:
-      { 'Jose_Fernando': np.array shape (N, 512) }   N = cantidad de embeddings del sujeto
+    """Carga y gestiona los embeddings faciales en memoria RAM para búsqueda rápida.
 
-    Al buscar, construye una matriz global (M_total, 512) y hace
-    una sola operación np.linalg.norm() — sin loops por persona.
+    La búsqueda se realiza con una sola operación matricial de NumPy
+    (sin bucles Python), calculando distancias L2 contra todos los
+    embeddings de todos los sujetos simultáneamente.
+
+    Attributes:
+        db_path (str): Ruta al directorio que contiene los archivos PKL.
+        _galeria (dict): Diccionario que mapea subject_id a su matriz de embeddings (N, 512).
+        _matrix_global (np.ndarray | None): Matriz única que concatena todos los embeddings.
+        _id_map (list): Mapeo de índices de la matriz global a subject_ids.
     """
 
     def __init__(self, db_path: str):
+        """Inicializa la galería y carga los datos desde el disco.
+
+        Args:
+            db_path (str): Ruta al directorio con archivos .pkl de embeddings.
+        """
         self.db_path = db_path
-        # { subject_id: matrix (N, 512) }
-        self._galeria: dict[str, np.ndarray] = {}
-        # Para búsqueda vectorizada: matriz plana + mapa de índice → subject_id
+        self._galeria: dict[str, np.ndarray] = {}  # { sid: matrix (N, 512) }
         self._matrix_global: np.ndarray | None = None
-        self._id_map: list[str] = []   # posición i → subject_id
+        self._id_map: list[str] = []  # índice i → subject_id
         self.cargar()
 
     # ------------------------------------------------------------------
 
     def cargar(self):
-        """Lee todos los PKL del directorio y los sube a RAM."""
+        """Lee todos los PKL del directorio y los sube a RAM.
+
+        Busca archivos que terminen en '_embedding.pkl', los carga y extrae
+        los embeddings normalizados. Al finalizar, reconstruye el índice global.
+        """
         self._galeria = {}
 
         if not os.path.exists(self.db_path):
-            print(f"  AVISO: no existe {self.db_path}")
+            print(f"  AVISO: directorio no encontrado — {self.db_path}")
             self._reconstruir_index()
             return
 
@@ -86,10 +114,10 @@ class GaleriaRAM:
             try:
                 with open(ruta, "rb") as f:
                     data = pickle.load(f)
-                embeddings = self._extraer_embeddings(data)
+                embeddings = self._leer_gallery(data)
                 if not embeddings:
+                    print(f"  AVISO: {fname} sin embeddings válidos — omitido")
                     continue
-                # subject_id = nombre del archivo sin sufijo
                 sid = fname.replace("_embedding.pkl", "")
                 self._galeria[sid] = np.array(embeddings, dtype=np.float32)
                 cargados += 1
@@ -100,148 +128,138 @@ class GaleriaRAM:
         self._reconstruir_index()
 
         total_embs = sum(m.shape[0] for m in self._galeria.values())
-        print(f"\n  DB cargada: {cargados} personas | "
-              f"{total_embs} embeddings totales en RAM"
-              + (f" | {errores} errores" if errores else ""))
+        print(
+            f"\n  DB cargada: {cargados} personas | {total_embs} embeddings en RAM"
+            + (f" | {errores} errores" if errores else "")
+        )
         for sid, mat in self._galeria.items():
             print(f"    {sid:<40}  {mat.shape[0]} embedding/s")
 
-    def _extraer_embeddings(self, data: dict) -> list:
+    def _leer_gallery(self, data: dict) -> list[np.ndarray]:
+        """Extrae y normaliza los embeddings de un diccionario de datos.
+
+        Args:
+            data (dict): Diccionario cargado desde un archivo PKL.
+
+        Returns:
+            list[np.ndarray]: Lista de embeddings normalizados L2.
         """
-        Compatible con el único formato que queda (v4):
-          data['gallery'] = [ {'embedding': array, ...}, ... ]
-        Por seguridad también acepta el v1 legacy por si quedara alguno.
-        """
+        if "gallery" not in data:
+            return []
         embs = []
-        if data.get("version") == 2 and "gallery" in data:
-            # Formato v4 — galería multi-ángulo
-            for entry in data["gallery"]:
-                emb  = entry["embedding"].astype(np.float32)
-                norm = np.linalg.norm(emb)
-                if norm > 0:
-                    embs.append(emb / norm)
-        elif "embedding" in data:
-            # Formato v1 legacy — por si acaso
-            emb  = data["embedding"].astype(np.float32)
+        for entry in data["gallery"]:
+            emb = np.array(entry["embedding"], dtype=np.float32)
             norm = np.linalg.norm(emb)
             if norm > 0:
                 embs.append(emb / norm)
         return embs
 
     def _reconstruir_index(self):
-        """Aplana la galería en una sola matriz para búsqueda vectorizada."""
+        """Aplana la galería en una sola matriz para búsqueda vectorizada.
+
+        Crea una matriz global NumPy y un mapa de IDs para permitir
+        la búsqueda eficiente mediante operaciones matriciales.
+        """
         filas, ids = [], []
         for sid, matrix in self._galeria.items():
             for emb in matrix:
                 filas.append(emb)
                 ids.append(sid)
-        if filas:
-            self._matrix_global = np.array(filas, dtype=np.float32)
-        else:
-            self._matrix_global = None
+        self._matrix_global = np.array(filas, dtype=np.float32) if filas else None
         self._id_map = ids
 
     # ------------------------------------------------------------------
 
-    def buscar(self, query: np.ndarray, umbral: float) -> tuple:
-        """
-        Búsqueda vectorizada L2 contra toda la DB en una sola operación.
+    def buscar(self, query: np.ndarray) -> tuple[bool, str | None, float]:
+        """Realiza una búsqueda vectorizada L2 contra toda la base de datos.
 
-        Retorna (encontrado: bool, subject_id: str | None, distancia: float)
+        Args:
+            query (np.ndarray): Embedding del rostro a buscar.
+
+        Returns:
+            tuple[bool, str | None, float]: Una tupla conteniendo:
+                - reconocido (bool): True si la distancia es menor al umbral.
+                - subject_id (str | None): ID del sujeto más cercano, o None si no hay datos.
+                - distancia_minima (float): La menor distancia L2 encontrada.
         """
         if self._matrix_global is None:
             return False, None, 2.0
 
         norm = np.linalg.norm(query)
-        q    = query / norm if norm > 0 else query
+        q = query / norm if norm > 0 else query
 
-        # (M_total,) — una distancia por embedding
-        dists  = np.linalg.norm(self._matrix_global - q, axis=1)
-        idx    = int(np.argmin(dists))
-        dist   = float(dists[idx])
-        sid    = self._id_map[idx]
+        dists = np.linalg.norm(self._matrix_global - q, axis=1)
+        idx = int(np.argmin(dists))
+        dist = float(dists[idx])
+        sid = self._id_map[idx]
 
-        return (dist < umbral), sid, dist
+        reconocido = dist < UMBRAL_CONFIRMAR
+        return reconocido, sid, dist
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Retorna el número de personas en la galería.
+
+        Returns:
+            int: Cantidad de sujetos únicos cargados.
+        """
         return len(self._galeria)
-
-
-# ==========================================================
-# MOTOR BUFFALO_L CONFIGURABLE
-# ==========================================================
-
-class MotorReconocimiento:
-    """
-    Envuelve FaceAnalysis con det_size configurable.
-    det_size=(1280,1280) detecta caras desde ~40px pero es más lento.
-    det_size=(640,640)   detecta desde ~80px, más rápido.
-    """
-
-    def __init__(self, det_size: int = 640):
-        size = (det_size, det_size)
-        print(f"\n  Cargando buffalo_l  det_size={size} ...")
-        self.app = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
-        )
-        self.app.prepare(ctx_id=0, det_size=size)
-        for m in self.app.models:
-            print(f"    sub-modelo: {m}")
-
-    def procesar_frame(self, frame: np.ndarray) -> list:
-        if frame is None or frame.size == 0:
-            return []
-        try:
-            faces = self.app.get(frame)
-        except Exception:
-            return []
-        resultados = []
-        for face in faces:
-            bbox = face.bbox.astype(int)
-            ancho = int(bbox[2] - bbox[0])
-            alto  = int(bbox[3] - bbox[1])
-            try:
-                p, y, r = face.pose
-            except Exception:
-                p, y, r = 0.0, 0.0, 0.0
-            emb = face.normed_embedding
-            if emb is None:
-                continue
-            resultados.append({
-                "bbox"     : bbox,
-                "embedding": emb,
-                "res"      : (ancho, alto),
-                "pose"     : (p, y, r),
-            })
-        return resultados
 
 
 # ==========================================================
 # STREAM RTSP SIN LATENCIA ACUMULADA
 # ==========================================================
 
+
 class CameraStream:
+    """Captura frames en un hilo secundario para minimizar latencia.
+
+    Asegura que el hilo principal siempre procese el frame más reciente,
+    evitando la acumulación en el buffer interno de OpenCV.
+
+    Attributes:
+        cap (cv2.VideoCapture): Objeto de captura de video.
+        ret (bool): Indica si la última lectura fue exitosa.
+        frame (np.ndarray): El frame más reciente capturado.
+        stopped (bool): Bandera para detener el hilo de captura.
+    """
+
     def __init__(self, source: str):
+        """Inicializa la captura de video.
+
+        Args:
+            source (str): Fuente de video (URL RTSP, ruta de archivo o índice de cámara).
+        """
         self.cap = cv2.VideoCapture(source)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         self.ret, self.frame = self.cap.read()
         self.stopped = False
 
-    def start(self):
+    def start(self) -> "CameraStream":
+        """Inicia el hilo de lectura de frames.
+
+        Returns:
+            CameraStream: La instancia actual de la clase.
+        """
         threading.Thread(target=self._update, daemon=True).start()
         return self
 
     def _update(self):
+        """Hilo interno que actualiza constantemente el frame más reciente."""
         while not self.stopped:
             ret, frame = self.cap.read()
             if ret:
                 self.ret, self.frame = ret, frame
 
-    def read(self):
+    def read(self) -> tuple[bool, np.ndarray]:
+        """Retorna el frame más reciente almacenado.
+
+        Returns:
+            tuple[bool, np.ndarray]: Éxito de la lectura y el frame (imagen).
+        """
         return self.ret, self.frame
 
     def stop(self):
+        """Detiene la captura y libera los recursos del video."""
         self.stopped = True
         self.cap.release()
 
@@ -250,71 +268,98 @@ class CameraStream:
 # DISPLAY
 # ==========================================================
 
+
 def _nombre_display(sid: str) -> str:
-    """Convierte 'Jose_Fernando_Loaiza_Ramirez' → 'Jose Fernando' para el label."""
+    """Formatea el ID del sujeto para mostrar en pantalla.
+
+    Convierte 'Jose_Fernando_Loaiza_Ramirez' → 'Jose Fernando'.
+
+    Args:
+        sid (str): ID del sujeto (generalmente el nombre del archivo PKL).
+
+    Returns:
+        str: Nombre formateado para la interfaz.
+    """
     partes = sid.replace("_embedding", "").split("_")
-    # Tomar solo nombre + primer apellido para que quepa en pantalla
     return " ".join(partes[:2]) if len(partes) >= 2 else partes[0]
 
 
-def dibujar_rostro(frame, bbox, nombre_display, dist, reconocido):
-    x1, y1, x2, y2 = [int(v) for v in bbox]
-    color = COLOR_VERDE if reconocido else COLOR_ROJO
-    label = nombre_display if reconocido else "Desconocido"
+def dibujar_rostro(frame: np.ndarray, bbox, nombre: str, dist: float, reconocido: bool):
+    """Dibuja el cuadro delimitador y la etiqueta de identidad.
 
-    # Bounding box
+    Args:
+        frame (np.ndarray): Imagen sobre la que se dibujará.
+        bbox (list|tuple): Coordenadas del rostro (x1, y1, x2, y2).
+        nombre (str): Nombre a mostrar en la etiqueta.
+        dist (float): Distancia L2 del reconocimiento.
+        reconocido (bool): Si el rostro fue identificado positivamente.
+    """
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+
+    color = COLOR_VERDE if reconocido else COLOR_ROJO
+
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # Fondo del texto para legibilidad
-    txt = f"{label}  {dist:.2f}"
+    txt = f"{nombre}  {dist:.2f}"
     (tw, th), bl = cv2.getTextSize(txt, FONT, 0.5, 1)
     y_bg = max(y1 - 6, th + 6)
-    cv2.rectangle(frame,
-                  (x1, y_bg - th - 4),
-                  (x1 + tw + 6, y_bg + bl),
-                  color, cv2.FILLED)
-    cv2.putText(frame, txt,
-                (x1 + 3, y_bg - 2),
-                FONT, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.rectangle(
+        frame, (x1, y_bg - th - 4), (x1 + tw + 6, y_bg + bl), color, cv2.FILLED
+    )
+    cv2.putText(frame, txt, (x1 + 3, y_bg - 2), FONT, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def dibujar_hud(frame, galeria, fps, det_size):
-    """Esquina superior izquierda: métricas de sesión."""
+def dibujar_hud(frame: np.ndarray, galeria: GaleriaRAM, fps: float):
+    """Dibuja información de estado en el frame.
+
+    Args:
+        frame (np.ndarray): Imagen sobre la que se dibujará.
+        galeria (GaleriaRAM): Instancia de la galería para obtener estadísticas.
+        fps (float): Cuadros por segundo actuales.
+    """
     info = [
         f"FPS: {fps:.1f}",
         f"Personas DB: {len(galeria)}",
-        f"Umbral L2: {UMBRAL_RECONOCIMIENTO}",
-        f"det_size: {det_size}x{det_size}",
-        "Q=salir  R=recargar DB",
+        f"Confirmar < {UMBRAL_CONFIRMAR}",
+        "Q = salir",
     ]
     for i, txt in enumerate(info):
-        cv2.putText(frame, txt, (8, 20 + i * 18),
-                    FONT, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.putText(
+            frame, txt, (8, 20 + i * 18), FONT, 0.45, (180, 180, 180), 1, cv2.LINE_AA
+        )
 
 
 # ==========================================================
-# LOOP PRINCIPAL
+# LOOP PRINCIPAL DE RECONOCIMIENTO
 # ==========================================================
 
-def procesar_fuente(fuente: str, motor: MotorReconocimiento,
-                    galeria: GaleriaRAM, det_size: int,
-                    usar_hilos: bool = False):
 
+def procesar_fuente(
+    fuente: str, engine: FaceEngine, galeria: GaleriaRAM, usar_hilos: bool = False
+):
+    """Ejecuta el loop de reconocimiento facial sobre una fuente de video.
+
+    Args:
+        fuente (str): URL RTSP o ruta de archivo de video.
+        engine (FaceEngine): Instancia del motor de reconocimiento.
+        galeria (GaleriaRAM): Instancia de la galería con embeddings cargados.
+        usar_hilos (bool): True para fuentes RTSP para eliminar latencia.
+    """
     if usar_hilos:
         print(f"  Conectando a {fuente} ...")
         cam = CameraStream(fuente).start()
-        time.sleep(1.5)  # warm-up
+        time.sleep(1.5)
     else:
         cam = cv2.VideoCapture(fuente)
         if not cam.isOpened():
             print(f"  ERROR: no se pudo abrir {fuente}")
             return
 
-    fps      = 0.0
-    t_fps    = time.time()
-    f_cnt    = 0
+    fps = 0.0
+    t_fps = time.time()
+    f_cnt = 0
 
-    print("  Procesando... (Q = salir  |  R = recargar DB)\n")
+    print("  Procesando...  (Q = salir)\n")
 
     while True:
         ret, frame = cam.read() if usar_hilos else cam.read()
@@ -322,46 +367,42 @@ def procesar_fuente(fuente: str, motor: MotorReconocimiento,
             break
 
         display = frame.copy()
-        rostros = motor.procesar_frame(frame)
+        rostros = engine.procesar_frame(frame)
 
         for r in rostros:
-            ancho = r["res"][0]
-            if ancho < TAMANO_MIN_PX:
+            if r["res"][0] < TAMANO_MIN_PX:
                 continue
 
-            reconocido, sid, dist = galeria.buscar(
-                r["embedding"], UMBRAL_RECONOCIMIENTO
-            )
-
-            nombre_lbl = _nombre_display(sid) if reconocido else "Desconocido"
-            dibujar_rostro(display, r["bbox"], nombre_lbl, dist, reconocido)
+            reconocido, sid, dist = galeria.buscar(r["embedding"])
+            nombre = _nombre_display(sid) if reconocido and sid else "Desconocido"
+            dibujar_rostro(display, r["bbox"], nombre, dist, reconocido)
 
         # FPS rolling cada 30 frames
         f_cnt += 1
         if f_cnt % 30 == 0:
-            fps   = 30.0 / max(time.time() - t_fps, 1e-6)
+            fps = 30.0 / max(time.time() - t_fps, 1e-6)
             t_fps = time.time()
 
-        dibujar_hud(display, galeria, fps, det_size)
+        dibujar_hud(display, galeria, fps)
 
-        # Redimensionar para mostrar (no altera el frame procesado)
+        # Redimensionar solo para visualización (no afecta el procesamiento)
         h, w = display.shape[:2]
         escala = min(1280 / w, 720 / h)
-        if escala < 1.0:
-            vis = cv2.resize(display,
-                             (int(w * escala), int(h * escala)),
-                             interpolation=cv2.INTER_LINEAR)
-        else:
-            vis = display
+        vis = (
+            cv2.resize(
+                display,
+                (int(w * escala), int(h * escala)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            if escala < 1.0
+            else display
+        )
 
         cv2.imshow("Reconocimiento Facial — buffalo_l", vis)
 
         tecla = cv2.waitKey(1) & 0xFF
         if tecla == ord("q"):
             break
-        elif tecla == ord("r"):
-            print("\n  Recargando DB ...")
-            galeria.cargar()
 
     if usar_hilos:
         cam.stop()
@@ -371,68 +412,67 @@ def procesar_fuente(fuente: str, motor: MotorReconocimiento,
 
 
 # ==========================================================
-# MENÚ
+# MENÚ INTERACTIVO
 # ==========================================================
 
+
 def menu():
+    """Muestra el menú principal y gestiona la interacción del usuario.
+
+    Carga la base de datos, inicializa el motor y permite al usuario elegir
+    la fuente de video (Cámaras IP o video local).
+    """
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--det_size", type=int, default=640,
-                        help="Resolucion del detector: 640 (rapido) o 1280 (detecta caras pequenas)")
+    parser.add_argument(
+        "--det_size",
+        type=int,
+        default=640,
+        help="Resolución del detector: 640 (rápido) | 1280 (cámaras lejanas)",
+    )
     args, _ = parser.parse_known_args()
-    det_size = args.det_size
 
-    print("\n" + "="*52)
+    print("\n" + "=" * 52)
     print("  SISTEMA DE RECONOCIMIENTO FACIAL")
-    print("  Modelo: buffalo_l")
-    print("="*52)
+    print("  Modelo  : buffalo_l")
+    print("  Hardware: GPU (CUDA) + fallback CPU")
+    print("=" * 52)
 
-    # Cargar galería en RAM una sola vez
     galeria = GaleriaRAM(DB_PATH)
 
     if len(galeria) == 0:
-        print("\n  AVISO: DB vacía. Registra personas primero.")
+        print(
+            "\n  AVISO: DB vacía — registra personas primero con registro_por_video.py"
+        )
 
-    # Cargar motor
-    motor = MotorReconocimiento(det_size=det_size)
+    engine = FaceEngine(det_size=args.det_size)
 
     while True:
-        print(f"\n{'─'*52}")
+        print(f"\n{'─' * 52}")
         print(f"  Personas en RAM : {len(galeria)}")
-        print(f"  Umbral L2       : {UMBRAL_RECONOCIMIENTO}")
-        print(f"  det_size        : {det_size}x{det_size}")
-        print(f"{'─'*52}")
+        print(f"  Umbral L2       : confirmar < {UMBRAL_CONFIRMAR}")
+        print(f"  det_size        : {args.det_size}x{args.det_size}")
+        print(f"{'─' * 52}")
         print("  1. Cámara 1  (IP .110)")
         print("  2. Cámara 2  (IP .111)")
         print("  3. Video local")
-        print("  r. Recargar DB desde disco")
         print("  q. Salir")
-        print(f"{'─'*52}")
+        print(f"{'─' * 52}")
 
         opc = input("  Opción: ").strip().lower()
 
         if opc == "1":
-            procesar_fuente(RTSP_CAM1, motor, galeria,
-                            det_size, usar_hilos=True)
-
+            procesar_fuente(RTSP_CAM1, engine, galeria, usar_hilos=True)
         elif opc == "2":
-            procesar_fuente(RTSP_CAM2, motor, galeria,
-                            det_size, usar_hilos=True)
-
+            procesar_fuente(RTSP_CAM2, engine, galeria, usar_hilos=True)
         elif opc == "3":
             ruta = input("  Ruta del video: ").strip().strip('"').strip("'")
             if os.path.exists(ruta):
-                procesar_fuente(ruta, motor, galeria,
-                                det_size, usar_hilos=False)
+                procesar_fuente(ruta, engine, galeria, usar_hilos=False)
             else:
                 print(f"  ERROR: no encontrado → {ruta}")
-
-        elif opc == "r":
-            galeria.cargar()
-
         elif opc == "q":
             print("  Saliendo.")
             break
-
         else:
             print("  Opción no válida.")
 
